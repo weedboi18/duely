@@ -19,7 +19,7 @@ from __future__ import annotations
 import sys, time, re
 from typing import Optional, Tuple
 import numpy as np
-
+import pyautogui
 import json, os, subprocess
 # Imaging / OCR
 from PIL import Image, ImageOps, ImageFilter
@@ -57,6 +57,7 @@ SETTINGS = {
     "prefer_dxcam": False,       # If True (and DXCAM is ok), try DXCAM first
     "planner_force_ocr": True,   # For testing: force planner to use OCR
 }
+pyautogui.FAILSAFE = True
 
 # Allow explicit Tesseract path if needed (e.g., on Windows when not in PATH)
 if SETTINGS.get("tesseract_cmd"):
@@ -328,7 +329,57 @@ def ocr_pass(frame: np.ndarray) -> str | None:
 
 # ---------------- Main loop ----------------
 # The main loop coordinates capture → stability → planning → OCR.
+def move_mouse(x, y, duration=0.1):
+    pyautogui.moveTo(x, y, duration=duration)
 
+
+def click(button="left", clicks=1, interval=0.05):
+    pyautogui.click(button=button, clicks=clicks, interval=interval)
+
+
+def type_text(text, interval=0.02):
+    pyautogui.write(text, interval=interval)
+
+
+def press_key(key):
+    pyautogui.press(key)
+
+
+def key_combo(keys):
+    pyautogui.hotkey(*keys)
+
+def execute_step(step):
+    action = step.get("action")
+
+    if action == "move_mouse":
+        move_mouse(step["x"], step["y"], step.get("duration", 0.1))
+        return
+
+    if action == "click":
+        click(
+            button=step.get("button", "left"),
+            clicks=step.get("clicks", 1),
+            interval=step.get("interval", 0.05)
+        )
+        return
+
+    if action == "type":
+        type_text(step.get("text", ""), step.get("interval", 0.02))
+        return
+
+    if action == "key":
+        press_key(step["key"])
+        return
+
+    if action == "key_combo":
+        key_combo(step["keys"])
+        return
+
+    if action == "sleep":
+        time.sleep(step.get("seconds", 0.2))
+        return
+
+    print("Unknown action:", action)
 
 def main():
     # Stability gate tuned by top-level SETTINGS for consistency

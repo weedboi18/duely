@@ -21,6 +21,8 @@ from typing import Optional, Tuple
 import numpy as np
 import pyautogui
 import json, os, subprocess
+from google import genai
+from google.genai import types
 # Imaging / OCR
 from PIL import Image, ImageOps, ImageFilter
 import imagehash
@@ -80,7 +82,7 @@ def _grab_dxcam() -> np.ndarray:
     cam = dxcam.create(output_idx=0)
     frame = cam.grab()  # ndarray (H, W, 3) in BGR order
     if frame is None:
-        # DXCAM occasionally returns None if no frame is available
+        # DXCAM occaok sionally returns None if no frame is available
         raise RuntimeError("dxcam returned None frame")
     return frame[..., ::-1].copy()  # Convert BGR→RGB in-place-copy for safety
 
@@ -327,7 +329,147 @@ def ocr_pass(frame: np.ndarray) -> str | None:
         print(f"[agent] Clipboard copy failed: {e}")
     return summary
 
+# ---------------- High-res fallback helper ----------------
+
+def request_high_res_plan(prompt: str, image_bytes: bytes):
+    """High-res fallback call to Gemini.
+
+    Called only when the low-res LLM response includes "needs_high_res": true.
+    Uses the same prompt but a full-resolution image.
+    Returns the raw text response from Gemini, or an empty string on failure.
+    """
+    api_key = os.environ.get("GOOGLE_API_KEY")
+    if not api_key:
+        return ""
+    try:
+        client = genai.Client(api_key=api_key)
+        image_part = types.Part.from_bytes(data=image_bytes, mime_type="image/png")
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=[prompt, image_part],
+        )
+        return response.text or ""
+    except Exception:
+        return ""
+
+from io import BytesIO
+
+# ---------------- Turn-based planner (actions) ----------------
+
+def parse_llm_response(raw: str, memory: str):
+    """Turn raw LLM text into structured plan.
+
+    We treat the LLM as trusted: if the JSON is missing or malformed,
+    this function raises a RuntimeError and the program stops instead of
+    trying to continue in a half-broken state.
+    """
+    # Find the JSON block
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        raise RuntimeError("LLM response could not be parsed: no JSON block found")
+
+    try:
+        payload = json.loads(raw[start:end + 1])
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"LLM JSON decoding failed: {e}")
+
+    # Top-level fields must exist and be of the right basic types
+    if not isinstance(payload.get("action_summary"), str):
+        raise RuntimeError("LLM JSON missing or invalid 'action_summary' string")
+    if not isinstance(payload.get("steps"), list):
+        raise RuntimeError("LLM JSON missing or invalid 'steps' list")
+
+    action_summary = payload["action_summary"]
+    steps = payload["steps"]
+    expect_change = bool(payload.get("expect_change", False))
+    needs_high_res = bool(payload.get("needs_high_res", False))
+
+    new_memory = action_summary
+    new_status = {"expect_change": expect_change, "needs_high_res": needs_high_res}
+
+    return action_summary, steps, new_memory, new_status
+
+
+def plan_turn(frame_rgb: np.ndarray, memory: str, status: dict):
+    """One planning turn: frame + memory/status -> (summary, steps, new_memory, new_status).
+
+    Uses Gemini (if configured) to plan low-level actions from a screenshot.
+    Any malformed LLM response raises and stops the program.
+    """
+    # --- encode image: low-res for main call, full-res for optional fallback ---
+    img_full = Image.fromarray(frame_rgb)
+
+    # Full-res bytes (for potential high-res fallback)
+    buf_full = BytesIO()
+    img_full.save(buf_full, format="PNG")
+    image_bytes_full = buf_full.getvalue()
+
+    # Low-res thumbnail bytes for the main planning call
+    img_low = img_full.copy()
+    img_low.thumbnail((640, 360))  # simple downscale to keep cost low
+    buf_low = BytesIO()
+    img_low.save(buf_low, format="PNG")
+    image_bytes_low = buf_low.getvalue()
+
+    # --- build prompt inline ---
+    status_text = json.dumps(status) if status else "{}"
+    prompt = f"""
+You are Duely, a desktop control agent.
+
+Context:
+- memory: {memory}
+- last_status: {status_text}
+
+You will be given a screenshot of the user's screen (as an image) and must decide
+what to do THIS TURN only.
+
+Allowed actions (JSON objects):
+- move_mouse: {{ "action": "move_mouse", "x": int, "y": int, "duration": float? }}
+- click:      {{ "action": "click", "button": "left"|"right"|"middle", "clicks": int?, "interval": float? }}
+- type:       {{ "action": "type", "text": string, "interval": float? }}
+- key:        {{ "action": "key", "key": string }}
+- sleep:      {{ "action": "sleep", "seconds": float }}
+
+Return ONLY valid JSON in this shape:
+{{
+  "action_summary": "short description of what you will do this turn",
+  "expect_change": true or false,
+  "needs_high_res": true or false,
+  "steps": [ {{...}}, {{...}} ]
+}}
+No explanations. JSON only.
+"""
+
+    llm = os.environ.get("DUELY_LLM", "").lower()
+
+    # --- call Gemini when configured ---
+    if llm.startswith("gemini"):
+        api_key = os.environ.get("GOOGLE_API_KEY")
+        if not api_key:
+            raise RuntimeError("GOOGLE_API_KEY not set; cannot call Gemini")
+        client = genai.Client(api_key=api_key)
+        image_part = types.Part.from_bytes(data=image_bytes_low, mime_type="image/png")
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=[prompt, image_part],
+        )
+        raw = response.text or ""
+    else:
+        # If no supported LLM is configured, stop instead of silently doing nothing.
+        raise RuntimeError("No supported LLM configured (expected DUELY_LLM to start with 'gemini')")
+
+    # If the model indicates it wants high-res, make a second call with full-res bytes.
+    # We still trust the final JSON fully and will crash if it is malformed.
+    # (For now we keep it simple: we always parse the first response and only
+    #  add high-res logic later if needed.)
+
+    action_summary, steps, new_memory, new_status = parse_llm_response(raw, memory)
+    return action_summary, steps, new_memory, new_status
+
 # ---------------- Main loop ----------------
+
+
 # The main loop coordinates capture → stability → planning → OCR.
 def move_mouse(x, y, duration=0.1):
     pyautogui.moveTo(x, y, duration=duration)
@@ -381,67 +523,25 @@ def execute_step(step):
 
     print("Unknown action:", action)
 
+
+
 def main():
-    # Stability gate tuned by top-level SETTINGS for consistency
-    gate = StabilityGate(
-        phash_threshold=SETTINGS["phash_threshold"],
-        stable_seconds=SETTINGS["stable_seconds"],
-    )
-
-    cooldown = 6.0          # Minimum seconds between planner triggers
-    last_trigger = 0.0       # Timestamp of last planner decision
-    last_fire_hash = None    # Hash of last frame when planner ran (avoid repeats)
-    rearm_needed = True      # Requires an unstable period before re-trigger
-
-    print("[agent] Armed. Planner-first. (Ctrl+C to exit)")
+    memory = ""
+    status = {}
+    print("[agent] Duely turn-based loop (stub). (Ctrl+C to exit)")
     while True:
-        # 1) Capture the latest frame and timestamp
         frame, ts = grab_frame()
 
-        # 2) Update stability state (returns: is_stable_now, since_ts, curr_hash)
-        is_stable, since, curr_hash = gate.update(frame, ts)
+        # TODO: downscale frame to low-res thumbnail for LLM
+        # TODO: call LLM with (frame, memory, status) to get action_summary + steps
+        steps = []  # placeholder list of actions from LLM
 
-        # If the screen is changing again, allow a future trigger after cooldown
-        if not is_stable:
-            rearm_needed = True
+        for step in steps:
+            execute_step(step)
+            # TODO: check for user interruption / stop signal here
 
-        # 3) If stable and cooled down, consider invoking the planner
-        if is_stable:
-            # Avoid refiring if the scene hash is near-identical to last fire
-            same_as_last = (last_fire_hash is not None and (curr_hash - last_fire_hash) <= 2)
+        # TODO: update memory and status based on LLM response and execution results
 
-            # Conditions to call planner:
-            # - We had instability since the last fire (rearm_needed)
-            # - Enough time has passed (cooldown)
-            # - The scene is not virtually identical to the last fired state
-            if rearm_needed and (ts - last_trigger) > cooldown and not same_as_last:
-                # Build a compact observation for the planner
-                obs = {
-                    "ts": ts,
-                    "frame_shape": frame.shape,
-                    "focus_window": getattr(gw.getActiveWindow(), "title", None),
-                }
-                decision = planner(obs)
-                if SETTINGS.get("debug"):
-                    print(f"[planner] decision: {decision}")
-
-                # 4) Execute OCR tool if planner says so; otherwise skip
-                if decision.get("use_ocr"):
-                    _ = ocr_pass(frame)
-                else:
-                    print("[agent] Skipping OCR (planner-first design).")
-
-                # Bookkeeping to throttle/avoid redundant triggers
-                last_trigger = ts
-                last_fire_hash = curr_hash
-                rearm_needed = False
-                time.sleep(0.5)  # small post-action pause
-
-        # Optional heartbeat during development
-        if SETTINGS.get("debug"):
-            print("[tick]", time.strftime("%H:%M:%S"))
-
-        # 5) Sleep to match target FPS; ensure non-negative
         time.sleep(max(0, 1.0 / SETTINGS["capture_fps"]))
 
 

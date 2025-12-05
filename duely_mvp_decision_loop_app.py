@@ -1,19 +1,4 @@
-# app.py — fresh, stable single-file MVP (planner-first, OCR as a tool)
-# -------------------------------------------------------------------
-# This script implements a minimal desktop "perception → decision" loop
-# for your Duely assistant. The agent:
-#   1) Captures the current screen (DXCAM if available; MSS otherwise)
-#   2) Checks visual stability (via perceptual hash) to avoid reprocessing
-#   3) Builds a tiny observation and asks a planner (LLM stub) whether to OCR
-#   4) If yes, OCRs the active-window region and summarizes to clipboard
-#   5) Sleeps according to a target FPS and repeats
-#
-# Notes on architecture:
-# - The StabilityGate detects when the screen has stopped changing enough to act.
-# - The planner() is a stub that can be wired to an LLM (e.g., Ollama). For now
-#   it can be forced via SETTINGS["planner_force_ocr"].
-# - OCR is kept as a tool (ocr_pass), isolated from the main loop.
-# - The code is intentionally single-file and dependency-light so we can iterate.
+# canvas_5.py — multi-turn Duely MVP with planner flags wired to execution
 
 from __future__ import annotations
 import sys, time, re
@@ -23,90 +8,107 @@ import pyautogui
 import json, os, subprocess
 from google import genai
 from google.genai import types
+from io import BytesIO
+
 # Imaging / OCR
 from PIL import Image, ImageOps, ImageFilter
 import imagehash
 import pytesseract
 
-# Windows helpers (used to detect the active window bounds for cropping)
+# Windows helpers
 import pygetwindow as gw
 
-# Clipboard (used to copy summary after OCR)
+# Clipboard
 import pyperclip
 
-# Capture backends (DXCAM optional, MSS default)
+# Capture backends (DXCAM optional, MSS fallback)
 try:
     import dxcam
     _DXCAM_OK = True
 except Exception:
-    _DXCAM_OK = False  # If DXCAM import fails, we will fall back to MSS
+    _DXCAM_OK = False
 
 try:
     import mss
 except Exception:
-    mss = None  # MSS might also be unavailable in some environments
+    mss = None
 
-# ---------------- SETTINGS ----------------
-# All operational toggles live here to keep the loop readable.
+# Optional hotkey stop
+try:
+    import keyboard
+    _KEYBOARD_OK = True
+except Exception:
+    keyboard = None
+    _KEYBOARD_OK = False
+
+STOP_REQUESTED = False
+
+
+def _install_hotkeys():
+    global STOP_REQUESTED
+    if not _KEYBOARD_OK:
+        return
+    try:
+        def trigger_stop():
+            global STOP_REQUESTED
+            STOP_REQUESTED = True
+
+        keyboard.add_hotkey("esc", trigger_stop)
+        keyboard.add_hotkey("ctrl+shift+q", trigger_stop)
+    except Exception:
+        pass
+
+
 SETTINGS = {
-    "capture_fps": 2,            # Target capture rate (frames per second)
-    "phash_threshold": 10,       # Max perceptual-hash distance to consider frames "similar"
-    "stable_seconds": 0.8,       # How long frames must remain similar to be considered stable
-    "ocr_max_chars": 2000,       # OCR output is truncated to this many characters
-    "crop_ratio": 0.90,          # Fallback center-crop ratio when no active window
-    "tesseract_cmd": None,       # Optional: full path to tesseract executable
-    "debug": False,              # Extra prints when True
-    "prefer_dxcam": False,       # If True (and DXCAM is ok), try DXCAM first
-    "planner_force_ocr": True,   # For testing: force planner to use OCR
+    "capture_fps": 1,
+    "phash_threshold": 10,
+    "stable_seconds": 0.8,
+    "stability_timeout": 4.0,
+    "ocr_max_chars": 2000,
+    "crop_ratio": 0.90,
+    "tesseract_cmd": None,
+    "debug": False,
+    "prefer_dxcam": False,
+    "planner_force_ocr": True,
 }
+
+# High-level task description for this run.
+# Edit this string to change what Duely is trying to accomplish.
+TASK_PROMPT = (
+    "Open a new text file on my computer and type 'Hello World!'"
+)
+
 pyautogui.FAILSAFE = True
 
-# Allow explicit Tesseract path if needed (e.g., on Windows when not in PATH)
 if SETTINGS.get("tesseract_cmd"):
     pytesseract.pytesseract.tesseract_cmd = SETTINGS["tesseract_cmd"]
 
 # ---------------- Capture ----------------
-# Two concrete capture implementations (+ a small orchestrator):
-#   _grab_dxcam(): fast on Windows GPUs; returns RGB ndarray
-#   _grab_mss(): reliable CPU fallback; returns RGB ndarray
-#   grab_frame(): chooses backend, returns (frame, timestamp)
 
 def _grab_dxcam() -> np.ndarray:
-    """Capture a single frame using DXCAM and convert BGR→RGB.
-
-    Returns
-    -------
-    np.ndarray
-        H×W×3 RGB image as uint8 array.
-    """
     cam = dxcam.create(output_idx=0)
-    frame = cam.grab()  # ndarray (H, W, 3) in BGR order
+    frame = cam.grab()
     if frame is None:
-        # DXCAM occaok sionally returns None if no frame is available
         raise RuntimeError("dxcam returned None frame")
-    return frame[..., ::-1].copy()  # Convert BGR→RGB in-place-copy for safety
+    return frame[..., ::-1].copy()
 
 
 def _grab_mss() -> np.ndarray:
-    """Capture a single frame using MSS and convert BGRA→RGB."""
     if mss is None:
         raise RuntimeError("mss not available.")
     with mss.mss() as sct:
-        mon = sct.monitors[1]             # Monitor 1 = virtual full desktop
-        img = np.array(sct.grab(mon))     # Returns BGRA uint8
-        rgb = img[..., :3][..., ::-1]     # Strip alpha; convert BGR→RGB
+        mon = sct.monitors[1]
+        img = np.array(sct.grab(mon))
+        rgb = img[..., :3][..., ::-1]
         return rgb.copy()
 
 
 def grab_frame() -> Tuple[np.ndarray, float]:
-    """Return a frame and a timestamp using the preferred backend."""
     ts = time.time()
-    arr = None
     if SETTINGS.get("prefer_dxcam") and _DXCAM_OK:
         try:
             arr = _grab_dxcam()
         except Exception:
-            # Fall back to MSS if DXCAM fails mid-run
             arr = _grab_mss()
     else:
         arr = _grab_mss()
@@ -114,53 +116,42 @@ def grab_frame() -> Tuple[np.ndarray, float]:
         print("[debug] frame:", arr.shape)
     return arr, ts
 
+
 # ---------------- Stability Gate ----------------
-# The gate uses perceptual hashing (pHash) to measure how much the current
-# frame differs from the previous one. If the distance remains below a
-# threshold long enough (stable_seconds), we consider the screen "stable".
 
 class StabilityGate:
     def __init__(self, phash_threshold: int = 6, stable_seconds: float = 1.5):
-        self.thresh = phash_threshold           # max pHash distance to be "similar"
-        self.stable_seconds = stable_seconds    # duration required to call it stable
+        self.thresh = phash_threshold
+        self.stable_seconds = stable_seconds
         self._last_hash: Optional[imagehash.ImageHash] = None
         self._stable_since: Optional[float] = None
 
     def _hash(self, frame_rgb: np.ndarray) -> imagehash.ImageHash:
-        """Compute the pHash of the frame (robust to small visual changes)."""
         return imagehash.phash(Image.fromarray(frame_rgb))
 
     def update(self, frame_rgb: np.ndarray, ts: float):
-        """Update stability state given the new frame and return a tuple:
-        (is_stable_now, since_timestamp_or_None, current_hash)
-        """
         h = self._hash(frame_rgb)
         if self._last_hash is None:
-            # First frame: initialize tracking but not yet stable
             self._last_hash = h
             self._stable_since = None
             return False, None, h
 
-        dist = (h - self._last_hash)  # Hamming distance between pHashes
+        dist = (h - self._last_hash)
         if dist <= self.thresh:
-            # Similar enough → either start or continue the stability timer
             if self._stable_since is None:
                 self._stable_since = ts
             stable_for = ts - self._stable_since
             self._last_hash = h
             return stable_for >= self.stable_seconds, self._stable_since, h
         else:
-            # Significant change → reset stability
             self._last_hash = h
             self._stable_since = None
             return False, None, h
 
-# ---------------- OCR helpers (tool) ----------------
-# These helpers are isolated so the OCR path can be unit-tested independently.
 
+# ---------------- OCR helpers ----------------
 
 def _center_crop(rgb: np.ndarray, ratio=0.75) -> np.ndarray:
-    """Return a center crop of the frame by the given ratio (0<ratio≤1)."""
     h, w, _ = rgb.shape
     nh, nw = int(h * ratio), int(w * ratio)
     y0 = (h - nh) // 2
@@ -169,8 +160,6 @@ def _center_crop(rgb: np.ndarray, ratio=0.75) -> np.ndarray:
 
 
 def _preprocess_for_ocr(rgb: np.ndarray) -> Image.Image:
-    """Lightweight preprocessing to help Tesseract: grayscale → autocontrast →
-    upscale slightly → sharpen."""
     img = Image.fromarray(rgb)
     img = ImageOps.grayscale(img)
     img = ImageOps.autocontrast(img)
@@ -180,34 +169,22 @@ def _preprocess_for_ocr(rgb: np.ndarray) -> Image.Image:
 
 
 def crop_active_window(frame_rgb: np.ndarray) -> np.ndarray:
-    """Crop to the active window bounds when available; otherwise use a
-    center crop (per SETTINGS["crop_ratio"]). This reduces OCR noise by
-    focusing on the most likely region of interest."""
     try:
         win = gw.getActiveWindow()
         if not win:
             return _center_crop(frame_rgb, SETTINGS.get("crop_ratio", 0.90))
         l, t, r, b = win.left, win.top, win.right, win.bottom
         h, w, _ = frame_rgb.shape
-        # Clamp to frame bounds to prevent negative/overflow indices
         l, t = max(0, l), max(0, t)
         r, b = min(w, r), min(h, b)
-        # Avoid tiny crops (e.g., when the OS reports a 0×0 window)
         if r - l < 100 or b - t < 100:
             return _center_crop(frame_rgb, SETTINGS.get("crop_ratio", 0.90))
         return frame_rgb[t:b, l:r]
     except Exception:
-        # If pygetwindow fails (no permission / platform quirk), fall back
-        return _center_crop(frame_rgb, SETTINGS.get("crop_ratio", 0.90))
+        return _center_crop(frame_rgb, 0.90)
 
 
 def is_meaningful(text: str) -> bool:
-    """Heuristic to decide whether OCR text looks like real content.
-    - Require a minimum length
-    - Require a minimum number of word-like tokens
-    - Require at least half the characters to be alphabetic
-    This avoids copying fragments, artifacts, or UI chrome.
-    """
     if not text or len(text) < 60:
         return False
     words = re.findall(r"[A-Za-z]{3,}", text)
@@ -218,18 +195,12 @@ def is_meaningful(text: str) -> bool:
 
 
 def ocr_text(roi_rgb: np.ndarray, max_chars: int = 2000) -> str:
-    """Run Tesseract OCR on the preprocessed region and trim output."""
     cfg = "--oem 1 --psm 3 -l eng --dpi 220"
     text = pytesseract.image_to_string(_preprocess_for_ocr(roi_rgb), config=cfg).strip()
     return (text[:max_chars] + " …") if len(text) > max_chars else text
 
 
 def quick_summarize(text: str, max_bullets: int = 5) -> str:
-    """Very lightweight extractive summarizer:
-    - Split lines, normalize whitespace
-    - Score lines by uppercase starts, punctuation, and length
-    - Keep the top-N as bullet points
-    """
     if not text:
         return "(no text detected)"
     lines = [re.sub(r"\s+", " ", ln.strip()) for ln in text.splitlines()]
@@ -238,90 +209,23 @@ def quick_summarize(text: str, max_bullets: int = 5) -> str:
         if not ln or len(ln) < 5:
             continue
         score = 0
-        score += sum(c.isupper() for c in ln[:30])   # Title-ish lines
+        score += sum(c.isupper() for c in ln[:30])
         score += ln.count(":") + ln.count("-") + ln.count("•")
-        score += min(len(ln) // 40, 3)               # Prefer longer lines up to a cap
+        score += min(len(ln) // 40, 3)
         scored.append((score, ln))
     scored.sort(reverse=True)
     keep = [ln for _, ln in scored[:max_bullets]]
     return "\n".join(f"• {ln}" for ln in keep) if keep else "(no salient lines found)"
 
-# ---------------- Planner (stub) ----------------
-# The planner returns a JSON-like dict indicating whether to use OCR now.
-# You can wire it to an LLM by setting the DUELY_LLM env var, e.g.:
-#   DUELY_LLM="ollama:llama3"
-# If no LLM is configured, it defaults to "skip" unless planner_force_ocr=True.
-
-
-def planner(observation: dict) -> dict:
-    # Hard override for testing: keep the outer loop deterministic while iterating
-    if SETTINGS.get("planner_force_ocr") is True:
-        return {"use_ocr": True, "notes": "forced by settings"}
-
-    # If no LLM configured, default to not using OCR (safe)
-    llm = os.environ.get("DUELY_LLM", "").lower()  # e.g., "ollama:llama3"
-    if not llm:
-        return {"use_ocr": False, "notes": "no LLM configured"}
-
-    # Build a compact prompt for the LLM. In practice you might include
-    # a downscaled thumbnail or features; we keep it text-only here.
-    prompt = f"""
-You are a tool selector for a desktop agent.
-Decide if OCR is appropriate right now. Output ONLY JSON with keys: use_ocr (true/false), notes.
-Observation:
-- ts: {observation.get('ts')}
-- frame_shape: {observation.get('frame_shape')}
-- focus_window: {observation.get('focus_window')}
-Guidance:
-- Use OCR when the active app likely has text (docs, email, browser reading, IDE, PDF, slides).
-- Skip when it looks like gaming/video/fullscreen graphics/empty desktop.
-JSON only:
-"""
-
-    # Example: DUELY_LLM="ollama:llama3"
-    if llm.startswith("ollama:"):
-        model = llm.split(":", 1)[1]
-        try:
-            res = subprocess.run(
-                ["ollama", "run", model],
-                input=prompt.encode("utf-8"),
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True
-            )
-            txt = res.stdout.decode("utf-8").strip()
-            # Extract JSON if the model wraps extra text around it
-            start = txt.find("{"); end = txt.rfind("}")
-            if start != -1 and end != -1 and end > start:
-                txt = txt[start:end+1]
-            return json.loads(txt)
-        except Exception as e:
-            # On LLM errors, fail safely (skip OCR) and note the error
-            return {"use_ocr": False, "notes": f"LLM error: {e}"}
-
-    # Unknown DUELY_LLM scheme → default safe behavior
-    return {"use_ocr": False, "notes": f"unsupported DUELY_LLM={llm}"}
-
-
-# ---------------- One-call OCR pass (tool) ----------------
-# A single function that crops, OCRs, summarizes, and copies to clipboard.
-
 
 def ocr_pass(frame: np.ndarray) -> str | None:
-    # Focus the OCR on the active window (or center crop fallback)
     roi = crop_active_window(frame)
-
-    # Raw OCR text (bounded by SETTINGS["ocr_max_chars"]) for safety
     txt = ocr_text(roi, max_chars=SETTINGS["ocr_max_chars"])
-
-    # Skip if text likely isn't meaningful (UI fragments / noise)
     if not is_meaningful(txt):
         print("[agent] OCR skipped — low meaningful content.")
         return None
-
-    # Extractive bullet summary for quick glance + shareability
     summary = quick_summarize(txt)
     print(f"\n=== SUMMARY ===\n{summary}\n===============\n")
-
-    # Best-effort copy to clipboard to speed up downstream use
     try:
         pyperclip.copy(summary)
         print("[agent] Copied summary to clipboard.")
@@ -329,15 +233,10 @@ def ocr_pass(frame: np.ndarray) -> str | None:
         print(f"[agent] Clipboard copy failed: {e}")
     return summary
 
+
 # ---------------- High-res fallback helper ----------------
 
-def request_high_res_plan(prompt: str, image_bytes: bytes):
-    """High-res fallback call to Gemini.
-
-    Called only when the low-res LLM response includes "needs_high_res": true.
-    Uses the same prompt but a full-resolution image.
-    Returns the raw text response from Gemini, or an empty string on failure.
-    """
+def request_high_res_plan(prompt: str, image_bytes: bytes) -> str:
     api_key = os.environ.get("GOOGLE_API_KEY")
     if not api_key:
         return ""
@@ -352,18 +251,10 @@ def request_high_res_plan(prompt: str, image_bytes: bytes):
     except Exception:
         return ""
 
-from io import BytesIO
 
-# ---------------- Turn-based planner (actions) ----------------
+# ---------------- Planner parsing + state ----------------
 
-def parse_llm_response(raw: str, memory: str):
-    """Turn raw LLM text into structured plan.
-
-    We treat the LLM as trusted: if the JSON is missing or malformed,
-    this function raises a RuntimeError and the program stops instead of
-    trying to continue in a half-broken state.
-    """
-    # Find the JSON block
+def parse_llm_response(raw: str):  # LLM -> structured plan + notes
     start = raw.find("{")
     end = raw.rfind("}")
     if start == -1 or end == -1 or end <= start:
@@ -374,107 +265,263 @@ def parse_llm_response(raw: str, memory: str):
     except json.JSONDecodeError as e:
         raise RuntimeError(f"LLM JSON decoding failed: {e}")
 
-    # Top-level fields must exist and be of the right basic types
     if not isinstance(payload.get("action_summary"), str):
         raise RuntimeError("LLM JSON missing or invalid 'action_summary' string")
     if not isinstance(payload.get("steps"), list):
         raise RuntimeError("LLM JSON missing or invalid 'steps' list")
 
+    todo = payload.get("todo", [])
+    if not isinstance(todo, list):
+        raise RuntimeError("LLM JSON missing or invalid 'todo' list")
+
+    # Option C: do not enforce notes type here; let the LLM control it.
+    # If "notes" is omitted, we treat it as "no change" later.
+    if "notes" in payload:
+        notes = payload["notes"]
+    else:
+        notes = None
+
     action_summary = payload["action_summary"]
     steps = payload["steps"]
-    expect_change = bool(payload.get("expect_change", False))
+
+    raw_expect_change = payload.get("expect_change", None)
+    if raw_expect_change not in (True, False, None):
+        raise RuntimeError("LLM JSON invalid 'expect_change' (must be true, false, or null)")
+    expect_change = raw_expect_change
+
     needs_high_res = bool(payload.get("needs_high_res", False))
 
-    new_memory = action_summary
-    new_status = {"expect_change": expect_change, "needs_high_res": needs_high_res}
+    skip_turn = bool(payload.get("skip_turn", False))
+    sleep_seconds = payload.get("sleep_seconds", 0.0)
+    try:
+        sleep_seconds = float(sleep_seconds)
+    except Exception:
+        sleep_seconds = 0.0
 
-    return action_summary, steps, new_memory, new_status
+    task_done = bool(payload.get("task_done", False))
+
+    return action_summary, steps, todo, notes, expect_change, needs_high_res, skip_turn, sleep_seconds, task_done
 
 
-def plan_turn(frame_rgb: np.ndarray, memory: str, status: dict):
-    """One planning turn: frame + memory/status -> (summary, steps, new_memory, new_status).
+def update_memory(memory: dict, action_summary: str, todo: list, notes):
+    new_memory = dict(memory) if memory is not None else {}
+    turn = int(new_memory.get("turn", 0)) + 1
+    new_memory["turn"] = turn
+    new_memory["last_action"] = action_summary
+    new_memory["todo"] = todo
 
-    Uses Gemini (if configured) to plan low-level actions from a screenshot.
-    Any malformed LLM response raises and stops the program.
-    """
-    # --- encode image: low-res for main call, full-res for optional fallback ---
+    # Option C: do not force notes into a dict.
+    # - If notes is None (key omitted), preserve existing notes.
+    # - If notes is present (any JSON type), overwrite previous notes with it.
+    if notes is not None:
+        new_memory["notes"] = notes
+
+    return new_memory
+
+
+def update_status(status: dict, expect_change, needs_high_res: bool,
+                  skip_turn: bool, sleep_seconds: float, task_done: bool) -> dict:
+    new_status = dict(status) if status is not None else {}
+    new_status["expect_change"] = expect_change
+    new_status["needs_high_res"] = bool(needs_high_res)
+    new_status["skip_turn"] = bool(skip_turn)
+    new_status["sleep_seconds"] = float(max(0.0, sleep_seconds))
+    new_status["task_done"] = bool(task_done)
+    return new_status
+
+
+def plan_turn(frame_rgb: np.ndarray, memory: dict, status: dict):
     img_full = Image.fromarray(frame_rgb)
 
-    # Full-res bytes (for potential high-res fallback)
     buf_full = BytesIO()
     img_full.save(buf_full, format="PNG")
     image_bytes_full = buf_full.getvalue()
 
-    # Low-res thumbnail bytes for the main planning call
     img_low = img_full.copy()
-    img_low.thumbnail((640, 360))  # simple downscale to keep cost low
+    img_low.thumbnail((1280, 720))
     buf_low = BytesIO()
     img_low.save(buf_low, format="PNG")
     image_bytes_low = buf_low.getvalue()
 
-    # --- build prompt inline ---
-    status_text = json.dumps(status) if status else "{}"
+    thumb_w, thumb_h = img_low.size
+
+    memory_text = json.dumps(memory or {}, ensure_ascii=False)
+    status = dict(status or {})
+    status["screen"] = {"width": int(thumb_w), "height": int(thumb_h)}
+    status_text = json.dumps(status, ensure_ascii=False)
     prompt = f"""
-You are Duely, a desktop control agent.
+You are Duely, a desktop control agent. You control the user's real desktop with mouse and keyboard.
 
-Context:
-- memory: {memory}
-- last_status: {status_text}
+You work in discrete TURNS. Each turn you:
+- Look at the screenshot image.
+- Read MEMORY_JSON (your own past plan state).
+- Read STATUS_JSON (environment signals).
+- Read TASK_PROMPT (the overall goal).
+- Decide what to do THIS TURN only and output JSON.
 
-You will be given a screenshot of the user's screen (as an image) and must decide
-what to do THIS TURN only.
+MEMORY_JSON (read-only):
+{memory_text}
 
-Allowed actions (JSON objects):
-- move_mouse: {{ "action": "move_mouse", "x": int, "y": int, "duration": float? }}
-- click:      {{ "action": "click", "button": "left"|"right"|"middle", "clicks": int?, "interval": float? }}
-- type:       {{ "action": "type", "text": string, "interval": float? }}
-- key:        {{ "action": "key", "key": string }}
-- sleep:      {{ "action": "sleep", "seconds": float }}
+STATUS_JSON (read-only):
+{status_text}
 
-Return ONLY valid JSON in this shape:
+TASK_PROMPT:
+{TASK_PROMPT}
+
+Coordinate system:
+- (0,0) is the top-left of the full desktop image.
+- All x,y are desktop pixels with 0 <= x < screen.width and 0 <= y < screen.height.
+
+Allowed actions:
+- move_mouse: {{"action":"move_mouse","x":int,"y":int,"duration":float?}}
+- click:      {{"action":"click","button":"left"|"right"|"middle","clicks":int?,"interval":float?}}
+- type:       {{"action":"type","text":string,"interval":float?}}
+- key:        {{"action":"key","key":string}}
+- key_combo:  {{"action":"key_combo","keys":[string,...]}}
+- scroll:     {{"action":"scroll","clicks":int,"x":int?,"y":int?}}
+- drag_mouse: {{"action":"drag_mouse","x":int,"y":int,"duration":float?,"button":"left"|"right"|"middle"}}
+- sleep:      {{"action":"sleep","seconds":float}}
+
+Todo list (your internal plan):
+- Use todo items for meaningful subgoals toward TASK_PROMPT.
+- Task status is one of: "todo" → "in_progress" → "done".
+- At the start of a turn, read MEMORY_JSON.todo to see which task (if any) is already "in_progress".
+- When you decide to work on a todo task this turn, keep it as "todo" in MEMORY_JSON, but in your NEW todo list you return, set that task to "in_progress".
+- Only mark a task "done" on a later turn, after it was already "in_progress" in MEMORY_JSON and you can now see that your previous actions visibly completed it.
+- Never change a task directly from "todo" to "done" in a single turn.
+- If the screen already looks complete at the start of a run, treat that as stale state for this run, not work you just performed.
+- Always return the full todo list each turn.
+
+Notes (scratchpad memory):
+- Use the "notes" field as a JSON object for any additional state that helps you reason across turns.
+- Examples: retry counters, flags like {{"saw_old_text": true}}, cached text, last window title, or whether you are waiting for a specific dialog.
+- Prefer small, factual keys and values over long prose.
+- You may add or update keys in "notes" as your understanding of the situation evolves.
+- Avoid deleting useful keys unless you intentionally want to clear them.
+- Send nothing in notes if no new notes are to be written
+- Try to reformat any mistake in notes to dictionary format
+
+Pacing and stability:
+- expect_change=true if your actions should visibly change the screen by next turn.
+- expect_change=false if you expect the screen to stay mostly the same.
+- expect_change=null if unsure.
+- If STATUS_JSON.expected_change_but_no_change is true, assume the UI did not respond; adjust your plan.
+- If STATUS_JSON.unexpected_change is true, re-evaluate where you are before acting.
+- Use sleep_seconds to request extra cooldown time between turns when needed.
+- Use skip_turn=true when you want the next turn to observe only.
+
+Return ONLY valid JSON like this:
 {{
   "action_summary": "short description of what you will do this turn",
-  "expect_change": true or false,
-  "needs_high_res": true or false,
-  "steps": [ {{...}}, {{...}} ]
+  "expect_change": true | false | null,
+  "needs_high_res": true | false,
+  "skip_turn": true | false,
+  "sleep_seconds": number,
+  "task_done": true | false,
+  "todo": [
+    {{"task": "string", "status": "todo" | "in_progress" | "done"}}
+  ],
+  "steps": [ {{"action": "..."}}, {{"action": "..."}} ]
 }}
+
 No explanations. JSON only.
 """
 
     llm = os.environ.get("DUELY_LLM", "").lower()
 
-    # --- call Gemini when configured ---
     if llm.startswith("gemini"):
         api_key = os.environ.get("GOOGLE_API_KEY")
         if not api_key:
             raise RuntimeError("GOOGLE_API_KEY not set; cannot call Gemini")
         client = genai.Client(api_key=api_key)
-        image_part = types.Part.from_bytes(data=image_bytes_low, mime_type="image/png")
+        image_part_low = types.Part.from_bytes(data=image_bytes_low, mime_type="image/png")
         response = client.models.generate_content(
             model="gemini-2.0-flash",
-            contents=[prompt, image_part],
+            contents=[prompt, image_part_low],
         )
         raw = response.text or ""
     else:
-        # If no supported LLM is configured, stop instead of silently doing nothing.
         raise RuntimeError("No supported LLM configured (expected DUELY_LLM to start with 'gemini')")
 
-    # If the model indicates it wants high-res, make a second call with full-res bytes.
-    # We still trust the final JSON fully and will crash if it is malformed.
-    # (For now we keep it simple: we always parse the first response and only
-    #  add high-res logic later if needed.)
+    (action_summary, steps, todo, notes, expect_change, needs_high_res,
+     skip_turn, sleep_seconds, task_done) = parse_llm_response(raw)
 
-    action_summary, steps, new_memory, new_status = parse_llm_response(raw, memory)
-    return action_summary, steps, new_memory, new_status
+    if needs_high_res:
+        raw_hi = request_high_res_plan(prompt, image_bytes_full)
+        if raw_hi:
+            (action_summary, steps, todo, notes, expect_change, needs_high_res2,
+             skip_turn, sleep_seconds, task_done) = parse_llm_response(raw_hi)
+            needs_high_res = needs_high_res2
 
-# ---------------- Main loop ----------------
+    new_memory = update_memory(memory, action_summary, todo, notes)
+    new_status = update_status(status, expect_change, needs_high_res,
+                               skip_turn, sleep_seconds, task_done)
+
+    return action_summary, steps, new_memory, new_status, raw
 
 
-# The main loop coordinates capture → stability → planning → OCR.
-def move_mouse(x, y, duration=0.1):
+# ---------------- Stability-based capture between turns ----------------
+
+def wait_for_stable_frame(gate: StabilityGate,
+                          last_turn_hash: Optional[imagehash.ImageHash],
+                          expect_change_hint):
+    timeout = float(SETTINGS.get("stability_timeout", 4.0))
+    phash_threshold = int(SETTINGS.get("phash_threshold", 10))
+    target_dt = 1.0 / max(1, int(SETTINGS.get("capture_fps", 2)))
+
+    start = time.time()
+    chosen_frame: Optional[np.ndarray] = None
+    chosen_ts: float = 0.0
+    chosen_hash: Optional[imagehash.ImageHash] = None
+
+    while True:
+        frame, ts = grab_frame()
+        is_stable, _, current_hash = gate.update(frame, ts)
+
+        chosen_frame, chosen_ts, chosen_hash = frame, ts, current_hash
+
+        now = time.time()
+        if is_stable or (now - start) >= timeout:
+            break
+        time.sleep(target_dt)
+
+    changed_vs_last_turn = False
+    if chosen_hash is not None and last_turn_hash is not None:
+        try:
+            changed_vs_last_turn = (chosen_hash - last_turn_hash) > phash_threshold
+        except Exception:
+            changed_vs_last_turn = False
+
+    expected_change_but_no_change = False
+    unexpected_change = False
+
+    if expect_change_hint is True:
+        if not changed_vs_last_turn:
+            expected_change_but_no_change = True
+    elif expect_change_hint is False:
+        if changed_vs_last_turn:
+            unexpected_change = True
+
+    return chosen_frame, chosen_ts, chosen_hash, expected_change_but_no_change, unexpected_change
+
+
+# ---------------- Action execution ----------------
+
+def clamp_point(x, y):
+    """Clamp a point to the current primary screen bounds.
+
+    This prevents the agent from sending the mouse off-screen, regardless of
+    the user's monitor or laptop resolution.
+    """
+    screen_w, screen_h = pyautogui.size()
+    x = max(0, min(screen_w - 1, int(x)))
+    y = max(0, min(screen_h - 1, int(y)))
+    return x, y
+
+
+def move_mouse(x, y, duration=0.25):  # smoother glide default
+    x, y = clamp_point(x, y)
     pyautogui.moveTo(x, y, duration=duration)
-
-
 def click(button="left", clicks=1, interval=0.05):
     pyautogui.click(button=button, clicks=clicks, interval=interval)
 
@@ -490,11 +537,32 @@ def press_key(key):
 def key_combo(keys):
     pyautogui.hotkey(*keys)
 
+
+def scroll(clicks, x=None, y=None):
+    if x is not None and y is not None:
+        x, y = clamp_point(x, y)
+        pyautogui.scroll(clicks, x=x, y=y)
+    else:
+        pyautogui.scroll(clicks)
+
+
+def drag_mouse(x, y, duration=0.2, button="left"):
+    x, y = clamp_point(x, y)
+    pyautogui.dragTo(x, y, duration=duration, button=button)
+
+
+def user_requested_stop() -> bool:
+    return STOP_REQUESTED
+
+
 def execute_step(step):
+    if user_requested_stop():
+        raise KeyboardInterrupt("Emergency stop requested")
+
     action = step.get("action")
 
     if action == "move_mouse":
-        move_mouse(step["x"], step["y"], step.get("duration", 0.1))
+        move_mouse(step["x"], step["y"], step.get("duration", 0.25))
         return
 
     if action == "click":
@@ -517,6 +585,23 @@ def execute_step(step):
         key_combo(step["keys"])
         return
 
+    if action == "scroll":
+        scroll(
+            step.get("clicks", -500),
+            step.get("x"),
+            step.get("y"),
+        )
+        return
+
+    if action == "drag_mouse":
+        drag_mouse(
+            step["x"],
+            step["y"],
+            step.get("duration", 0.2),
+            step.get("button", "left"),
+        )
+        return
+
     if action == "sleep":
         time.sleep(step.get("seconds", 0.2))
         return
@@ -524,35 +609,184 @@ def execute_step(step):
     print("Unknown action:", action)
 
 
+# ---------------- Main loop ----------------
+
+
+def _suspicious_todo_jump(prev_memory: dict, new_memory: dict) -> bool:
+    try:
+        old_todo = (prev_memory or {}).get("todo") or []
+        new_todo = (new_memory or {}).get("todo") or []
+        old_map = {}
+        for item in old_todo:
+            if isinstance(item, dict):
+                task = item.get("task")
+                status = item.get("status")
+                if isinstance(task, str) and isinstance(status, str):
+                    old_map[task] = status
+        for item in new_todo:
+            if not isinstance(item, dict):
+                continue
+            task = item.get("task")
+            status = item.get("status")
+            if not isinstance(task, str) or not isinstance(status, str):
+                continue
+            if status == "done" and old_map.get(task) == "todo":
+                return True
+    except Exception:
+        pass
+    return False
+
 
 def main():
-    memory = ""
-    status = {}
-    print("[agent] Duely turn-based loop (stub). (Ctrl+C to exit)")
-    while True:
-        frame, ts = grab_frame()
+    _install_hotkeys()
 
-        # TODO: downscale frame to low-res thumbnail for LLM
-        # TODO: call LLM with (frame, memory, status) to get action_summary + steps
-        steps = []  # placeholder list of actions from LLM
+    memory = {
+        "turn": 0,
+        "last_action": None,
+        "todo": [],
+        "notes": {},
+    }
+    status: dict = {}
+
+    gate = StabilityGate(
+        phash_threshold=SETTINGS.get("phash_threshold", 10),
+        stable_seconds=SETTINGS.get("stable_seconds", 0.8),
+    )
+
+    last_turn_hash: Optional[imagehash.ImageHash] = None
+    screen_ref_hash: Optional[imagehash.ImageHash] = None
+    screen_ref_ts: Optional[float] = None
+    screen_age = 0.0
+
+    print("[agent] Duely multi-turn planner MVP.")
+
+    turn_idx = 0
+    while True:
+
+        turn_idx += 1
+        if user_requested_stop():
+            print("[agent] Stop requested, exiting loop.")
+            break
+
+        expect_hint = status.get("expect_change", None)
+
+        if expect_hint is None:
+
+            frame, ts = grab_frame()
+            try:
+                current_hash = imagehash.phash(Image.fromarray(frame))
+            except Exception:
+                current_hash = None
+            expected_change_but_no_change = False
+            unexpected_change = False
+        else:
+
+            frame, ts, current_hash, expected_change_but_no_change, unexpected_change = (
+                wait_for_stable_frame(gate, last_turn_hash, expect_hint)
+            )
+
+        status["expected_change_but_no_change"] = bool(expected_change_but_no_change)
+        status["unexpected_change"] = bool(unexpected_change)
+
+        if current_hash is not None:
+            print("hello this is loop", turn_idx)
+            last_turn_hash = current_hash
+            try:
+                if screen_ref_hash is None:
+                    screen_ref_hash = current_hash
+                    screen_ref_ts = ts
+                    screen_age = 0.0
+                else:
+                    dist = current_hash - screen_ref_hash
+                    if dist <= SETTINGS.get("phash_threshold", 10):
+                        if screen_ref_ts is not None:
+                            screen_age = ts - screen_ref_ts
+                    else:
+                        screen_ref_hash = current_hash
+                        screen_ref_ts = ts
+                        screen_age = 0.0
+            except Exception:
+                pass
+
+
+        status["screen_age"] = float(screen_age)
+
+        if SETTINGS.get("debug"):
+            print(f"[agent] Turn {turn_idx}: ts={ts}, shape={frame.shape}, screen_age={screen_age:.2f}s")
+
+        action_summary, steps, new_memory, new_status, raw = plan_turn(frame, memory, status)
+
+        # Guard against illegal todo transitions (todo -> done in one step).
+        if _suspicious_todo_jump(memory, new_memory):
+            print("[agent] Suspicious todo->done jump detected; skipping this turn's plan.")
+            # Do not update memory or status, do not execute steps; just sleep and retry.
+            base_sleep = 1.0 / max(1, SETTINGS.get("capture_fps", 2))
+            extra_sleep = float(status.get("sleep_seconds", 0.0) or 0.0)
+            time.sleep(base_sleep + extra_sleep)
+            continue
+
+        # (removed RAW LLM RESPONSE printing)
+        # print("===== RAW LLM RESPONSE") =====")
+        # print(raw)
+        print("===== PARSED PLAN =====")
+        print("action_summary:", action_summary)
+        print("steps:", steps)
+        print("new_memory:", new_memory)
+        print("new_status:", new_status)
+        print("task_done:", new_status.get("task_done"))
+        print("==============================")
+
+        memory, status = new_memory, new_status
+
+        # If the planner declares the high-level task finished, exit cleanly.
+        if bool(status.get("task_done")):
+            print("[agent] task_done=True from planner — exiting main loop.")
+            break
+
+        skip_turn = bool(status.get("skip_turn", False))
+        extra_sleep = float(status.get("sleep_seconds", 0.0) or 0.0)
+        base_sleep = 1.0 / max(1, SETTINGS.get("capture_fps", 2))
+
+        if skip_turn:
+            if SETTINGS.get("debug"):
+                print(f"[agent] Turn {turn_idx}: skip_turn=True, sleeping {base_sleep + extra_sleep:.2f}s")
+            time.sleep(base_sleep + extra_sleep)
+            continue
+
+        # Scale coordinates from model thumbnail space to full screen space
+        scale_x = scale_y = 1.0
+        screen_info = status.get("screen")
+        if isinstance(screen_info, dict):
+            try:
+                thumb_w = int(screen_info.get("width") or 0)
+                thumb_h = int(screen_info.get("height") or 0)
+                if thumb_w > 0 and thumb_h > 0:
+                    full_w, full_h = pyautogui.size()
+                    scale_x = full_w / thumb_w
+                    scale_y = full_h / thumb_h
+            except Exception:
+                pass
 
         for step in steps:
+            if "x" in step and "y" in step:
+                try:
+                    step["x"] = int(step["x"] * scale_x)
+                    step["y"] = int(step["y"] * scale_y)
+                except Exception:
+                    pass
             execute_step(step)
-            # TODO: check for user interruption / stop signal here
 
-        # TODO: update memory and status based on LLM response and execution results
-
-        time.sleep(max(0, 1.0 / SETTINGS["capture_fps"]))
+        if extra_sleep > 0:
+            time.sleep(extra_sleep)
+        time.sleep(base_sleep)
 
 
 if __name__ == "__main__":
-    print("STARTED app.py with:", sys.executable)
+    print("STARTED canvas_5.py with:", sys.executable)
     time.sleep(0.2)
     try:
         main()
     except Exception:
-        # Print the traceback to stderr and wait for Enter so console windows
-        # (e.g., on Windows) don’t disappear immediately after a crash.
         import traceback
         traceback.print_exc()
-        input("\n[agent] Crashed. Press Enter to close…")
+        input("[agent] Crashed. Press Enter to close…")
